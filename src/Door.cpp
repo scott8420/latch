@@ -19,6 +19,7 @@
 #include <linux/fs.h>        // FIDEDUPERANGE
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>     // the Tag verb
 #include <unistd.h>
 
 // Door.cpp -- the ONLY file in Rouster that changes a user's files. The
@@ -41,13 +42,14 @@ const char* verb_name(Verb v) {
         case Verb::Copy: return "copy";
         case Verb::Settings: return "settings";
         case Verb::Root: return "root";
+        case Verb::Tag: return "tag";
     }
     return "?";
 }
 bool creates(Verb v) { return v == Verb::Write || v == Verb::Clone || v == Verb::MakeDir || v == Verb::Copy; }
 
 const std::vector<Verb>& verbs() {
-    static const std::vector<Verb> v = {Verb::Trash, Verb::Move, Verb::Write, Verb::Clone, Verb::Dedupe, Verb::MakeDir, Verb::Copy, Verb::Settings, Verb::Root};
+    static const std::vector<Verb> v = {Verb::Trash, Verb::Move, Verb::Write, Verb::Clone, Verb::Dedupe, Verb::MakeDir, Verb::Copy, Verb::Settings, Verb::Root, Verb::Tag};
     return v;
 }
 
@@ -57,6 +59,36 @@ Verb verb_of(const std::string& s) {
     return Verb::Trash;
 }
 }  // namespace
+
+std::string tag_name_problem(const std::string& name) {
+    const std::string pre = kTagPrefix;
+    if (name.rfind(pre, 0) != 0) return "not a " + pre + "* tag: " + name;
+    if (name.size() == pre.size()) return "a tag needs a name after " + pre;
+    if (name.size() > 255) return "tag name too long: " + name;
+    for (std::size_t i = pre.size(); i < name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (!(std::islower(c) || std::isdigit(c) || c == '.' || c == '_' || c == '-'))
+            return "not a tag name ([a-z0-9._-] after " + pre + "): " + name;
+    }
+    return {};
+}
+
+bool tag_of(const std::string& path, const std::string& name, std::string& value, std::string* err) {
+    value.clear();
+    for (int tries = 0; tries < 3; ++tries) {
+        const ssize_t n = ::lgetxattr(path.c_str(), name.c_str(), nullptr, 0);
+        if (n < 0) {
+            if (err) *err = errno == ENODATA ? std::string() : std::string(std::strerror(errno));
+            return false;
+        }
+        value.resize(static_cast<std::size_t>(n));
+        const ssize_t m = n == 0 ? 0 : ::lgetxattr(path.c_str(), name.c_str(), value.data(), value.size());
+        if (m >= 0) { value.resize(static_cast<std::size_t>(m)); if (err) err->clear(); return true; }
+        if (errno != ERANGE) { if (err) *err = std::strerror(errno); return false; }   // grew between calls: again
+    }
+    if (err) *err = "the tag kept changing size";
+    return false;
+}
 
 bool identity_of(const std::string& path, Identity& out) {
     struct stat st{};
@@ -102,6 +134,21 @@ int rename_noreplace(const std::string& a, const std::string& b) {
 
 bool inside(const std::string& path, const std::string& dir) {   // strictly below, or equal
     return path == dir || (path.size() > dir.size() && path.rfind(dir, 0) == 0 && path[dir.size()] == '/');
+}
+
+// Tag values go into the manifest as hex: a value someone else wrote may not be
+// UTF-8, and the manifest is JSON.
+std::string hex_of(const std::string& s) {
+    static const char* h = "0123456789abcdef";
+    std::string o;
+    for (unsigned char c : s) { o += h[c >> 4]; o += h[c & 15]; }
+    return o;
+}
+std::string unhex(const std::string& s) {
+    const auto v = [](char c) { return c >= 'a' ? c - 'a' + 10 : c - '0'; };
+    std::string o;
+    for (std::size_t i = 0; i + 1 < s.size(); i += 2) o += static_cast<char>(v(s[i]) * 16 + v(s[i + 1]));
+    return o;
 }
 
 std::string ident_json(const Identity& i) {
@@ -242,6 +289,13 @@ bool Door::load() {
             r.info = j.value("info", "");
             r.src = j.value("src", "");
             r.when = j.value("when", 0ll);
+            if (r.verb == Verb::Tag) {
+                r.attr = j.value("attr", "");
+                r.had = j.value("had", false);
+                r.untag = j.value("untag", false);
+                r.before = unhex(j.value("before", ""));
+                r.after = unhex(j.value("after", ""));
+            }
             if (j.contains("ident")) {
                 const auto& i = j["ident"];
                 r.ident = {i.value("dev", 0ull), i.value("ino", 0ull), i.value("size", 0ull),
@@ -270,6 +324,20 @@ bool Door::load() {
         if (r.verb == Verb::Root) {       // the same: what root did can't be looked at from here
             r.state = State::Done;
             m_unfinished.push_back("root " + r.to + " -- may or may not have happened");
+            continue;
+        }
+        if (r.verb == Verb::Tag) {        // look at the tag: ours -> done, as before -> not done
+            std::string v;
+            Identity at{};
+            const bool same = identity_of(r.from, at) && at.dev == r.ident.dev && at.ino == r.ident.ino;
+            const bool has = same && tag_of(r.from, r.attr, v);
+            const bool ours = same && (r.untag ? !has : has && v == r.after);
+            const bool old = same && (r.had ? has && v == r.before : !has);
+            if (ours && !old) r.state = State::Done;
+            else if (old) r.state = State::Failed;   // also when set == before: nothing to undo either way
+            else r.state = State::Failed, r.error = "unaccounted for after a crash";
+            m_unfinished.push_back("tag " + r.attr + " on " + r.from + " -- " +
+                                   (r.state == State::Done ? "had happened" : "had not happened"));
             continue;
         }
         Identity at_to{}, at_from{};
@@ -371,6 +439,21 @@ std::string Door::refusal(const Action& a, const std::vector<std::string>& made,
     }
     if (auto w = walk(a.from, false); !w.empty()) return w;
     if (inside(a.from, m_data) || inside(m_data, a.from)) return own_records() + a.from;
+
+    if (a.verb == Verb::Tag) {
+        if (!a.to.empty()) return "a tag names one file, no destination: " + a.to;
+        if (auto why = tag_name_problem(a.attr); !why.empty()) return why;
+        if (!a.untag) {
+            if (a.content.size() > kTagMax) return "tag value too long: " + a.attr;
+            if (a.content.find('\0') != std::string::npos) return "tag value is not text: " + a.attr;
+        } else if (!a.content.empty()) return "an untag carries no value: " + a.attr;
+        if (inside(a.from, m_trash) || inside(m_trash, a.from)) return "in the Trash: " + a.from;
+        struct stat st{};
+        if (::lstat(a.from.c_str(), &st) != 0) return "does not exist: " + a.from;
+        if (S_ISLNK(st.st_mode)) return "a symlink is never tagged: " + a.from;
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return "not a file or folder: " + a.from;
+        return {};
+    }
 
     if (a.verb == Verb::Dedupe) {
         if (bad(a.to)) return "not a clean absolute path: " + a.to;
@@ -603,6 +686,7 @@ Result Door::run(const Plan& plan) {
         r.when = now_s();
         if (r.verb == Verb::Settings) { if (!prep_settings(r, a)) { /* r.error set */ } }
         else if (r.verb == Verb::Root) { r.to = a.content; if (root_refused) r.error = "skipped -- not authorised"; }
+        else if (r.verb == Verb::Tag) { if (!prep_tag(r, a)) { /* r.error set */ } }
         else if (creates(r.verb)) { if (!do_create(r, a)) { /* r.error set */ } }
         else if (r.verb == Verb::Dedupe) { if (!identity_of(r.to, r.ident)) r.error = "vanished before it could be shared"; }
         else if (!identity_of(r.from, r.ident)) { r.error = "vanished before it could be moved"; }
@@ -610,9 +694,17 @@ Result Door::run(const Plan& plan) {
 
         if (r.error.empty()) {
             // Write-ahead: the intent is on disk before the rename happens.
-            if (!append(json{{"t", "intent"}, {"id", r.id}, {"batch", r.batch}, {"verb", verb_name(r.verb)},
-                             {"from", r.from}, {"to", r.to}, {"info", r.info}, {"src", r.src}, {"when", r.when},
-                             {"ident", json::parse(ident_json(r.ident))}}.dump())) {
+            json ij{{"t", "intent"}, {"id", r.id}, {"batch", r.batch}, {"verb", verb_name(r.verb)},
+                    {"from", r.from}, {"to", r.to}, {"info", r.info}, {"src", r.src}, {"when", r.when},
+                    {"ident", json::parse(ident_json(r.ident))}};
+            if (r.verb == Verb::Tag) {
+                ij["attr"] = r.attr;
+                ij["had"] = r.had;
+                ij["untag"] = r.untag;
+                ij["before"] = hex_of(r.before);
+                ij["after"] = hex_of(r.after);
+            }
+            if (!append(ij.dump())) {
                 if (!r.info.empty()) ::unlink(r.info.c_str());
                 res.messages.push_back("could not write the manifest -- stopped before " + r.from);
                 break;
@@ -623,6 +715,7 @@ Result Door::run(const Plan& plan) {
             const bool acted = live.verb == Verb::Dedupe     ? do_dedupe(live)
                              : live.verb == Verb::Settings ? do_settings(live)
                              : live.verb == Verb::Root     ? do_root(live)
+                             : live.verb == Verb::Tag      ? do_tag(live)
                                                            : rename_noreplace(live.from, live.to) == 0;
             if (acted) {
                 live.state = State::Done;
@@ -631,7 +724,8 @@ Result Door::run(const Plan& plan) {
                 append(dj.dump());
                 ++res.done;
             } else {
-                if (live.verb != Verb::Dedupe && live.verb != Verb::Settings && live.verb != Verb::Root)
+                if (live.verb != Verb::Dedupe && live.verb != Verb::Settings && live.verb != Verb::Root &&
+                    live.verb != Verb::Tag)
                     live.error = errno == EXDEV ? "on another filesystem -- " + g_app + " never copies-and-deletes"
                                                 : std::string(std::strerror(errno));
                 if (!live.info.empty()) ::unlink(live.info.c_str());
@@ -728,7 +822,41 @@ bool Door::do_root(Record& r) {
     return false;
 }
 
+bool Door::prep_tag(Record& r, const Action& a) {
+    if (!identity_of(r.from, r.ident)) { r.error = "vanished before it could be tagged"; return false; }
+    r.attr = a.attr;
+    r.untag = a.untag;
+    r.after = a.untag ? std::string() : a.content;
+    r.to = "xattr:" + a.attr;
+    std::string err;
+    r.had = tag_of(r.from, r.attr, r.before, &err);
+    if (!r.had && !err.empty()) { r.error = "could not read the tag: " + err; return false; }
+    return true;
+}
+
+bool Door::do_tag(Record& r) {
+    const int rc = r.untag ? ::lremovexattr(r.from.c_str(), r.attr.c_str())
+                           : ::lsetxattr(r.from.c_str(), r.attr.c_str(), r.after.data(), r.after.size(), 0);
+    if (rc == 0 || (r.untag && errno == ENODATA)) return true;   // untag of an absent tag: already so
+    r.error = errno == ENOTSUP ? std::string("this filesystem keeps no tags (xattrs)") : std::string(std::strerror(errno));
+    return false;
+}
+
+bool Door::undo_tag(Record& r, std::string& why) {
+    Identity now{};
+    if (!identity_of(r.from, now)) { why = "no longer at " + r.from; return false; }
+    if (!(now.dev == r.ident.dev && now.ino == r.ident.ino)) { why = "something else is at " + r.from + " now"; return false; }
+    std::string v;
+    const bool has = tag_of(r.from, r.attr, v);
+    if (r.untag ? has : (!has || v != r.after)) { why = "the tag " + r.attr + " changed since -- left as it is"; return false; }
+    const int rc = r.had ? ::lsetxattr(r.from.c_str(), r.attr.c_str(), r.before.data(), r.before.size(), 0)
+                         : ::lremovexattr(r.from.c_str(), r.attr.c_str());
+    if (rc != 0 && !(!r.had && errno == ENODATA)) { why = std::strerror(errno); return false; }
+    return true;
+}
+
 bool Door::undo_one(Record& r, std::string& why) {
+    if (r.verb == Verb::Tag) return undo_tag(r, why);
     if (r.verb == Verb::Root) return true;   // nothing moved: the step is closed (a snapshot isn't taken back)
     if (r.verb == Verb::Settings) return undo_settings(r, why);
     Identity now{};

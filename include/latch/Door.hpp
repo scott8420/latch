@@ -83,18 +83,31 @@
 // at; it counts as done, and Activity says it may or may not have happened.
 // With a fixture home (ROUSTER_HOME) the helper is asked for a --dry-run.
 //
+// One verb changes a TAG, not a file's bytes or place (latch s002, for Tidy):
+// Tag sets (or, with `untag`, removes) ONE extended attribute on `from`. Only
+// the `user.tidy.` namespace -- any other name is refused, so the door cannot
+// touch another program's xattrs (user.xdg.origin.url, security.*, ...). The
+// value is text (no NUL, <= kTagMax). Before it acts the door reads what the
+// tag is now (absent, or its value) and journals it with the new value and
+// the file's identity. Undo checks the SAME file (dev + inode) still carries
+// the value the door wrote, then puts the old value back (or removes the tag
+// if there was none). A symlink is never tagged (l*xattr: never followed).
+// A crash between intent and outcome is resolved by looking at the tag.
+//
 // Hard-delete of a user's file does not exist here, and will not (§1.1).
 // ─────────────────────────────────────────────────────────────────────────────
 namespace latch::door {
 
-enum class Verb { Trash, Move, Write, Clone, Dedupe, MakeDir, Copy, Settings, Root };
-const char* verb_name(Verb v);   // "trash", "move", "write", "clone", "dedupe", "mkdir", "copy", "settings", "root"
+enum class Verb { Trash, Move, Write, Clone, Dedupe, MakeDir, Copy, Settings, Root, Tag };
+const char* verb_name(Verb v);   // "trash", "move", "write", "clone", "dedupe", "mkdir", "copy", "settings", "root", "tag"
 bool creates(Verb v);            // Write, Clone, MakeDir, Copy: `to` is made (Copy: from `from`; the others have no source)
 // THE VERB TABLE the selftest gate walks: a verb added to the enum and not
 // here fails the gate's count; every verb here is run through the door,
 // checked to be one step, and undone back to the exact tree.
 const std::vector<Verb>& verbs();
-inline constexpr int kVerbCount = 9;
+inline constexpr int kVerbCount = 10;
+inline constexpr std::size_t kTagMax = 1024;            // Tag: a value is a word, a UUID, a purpose's name
+inline constexpr const char* kTagPrefix = "user.tidy.";  // Tag: the only namespace the door will set or clear
 inline constexpr std::size_t kWriteMax = 4 * 1024 * 1024;   // Write is for text Rouster made (RESTORE.txt, a dconf dump): 4 MiB (64 KB until s012)
 
 struct Action {
@@ -111,7 +124,15 @@ struct Action {
     std::string branch;          // Clone: check this branch out ("" = the remote's default)
     std::string commit;          // Clone: must be this commit or an ancestor of HEAD ("" = any)
     // Dedupe: `from` is the keeper (its blocks), `to` the copy that will share them.
+    std::string attr;            // Tag: the xattr name, "user.tidy.<key>"; `content` is its value
+    bool        untag = false;   // Tag: remove `attr` instead of setting it
 };
+
+// Tag: "" if `name` is a tag the door may set ("user.tidy." + [a-z0-9._-]+); else why not.
+std::string tag_name_problem(const std::string& name);
+// Tag: the value of xattr `name` on `path` (never following a symlink).
+// false = absent (or unreadable: `err` says which).
+bool tag_of(const std::string& path, const std::string& name, std::string& value, std::string* err = nullptr);
 
 // A dconf dump's keys, as full paths ("/org/gnome/desktop/interface/color-scheme").
 std::vector<std::string> dconf_keys(const std::string& ini);
@@ -178,6 +199,11 @@ struct Record {
     State         state = State::Intent;
     std::string   error;
     std::string   note;             // Root: what the helper said it did
+    // Tag (r.to = "xattr:<attr>"):
+    std::string   attr;
+    bool          had = false;      // the tag existed before
+    std::string   before, after;    // its value before; what the door set (untag: unused)
+    bool          untag = false;
 };
 
 struct Batch {
@@ -242,6 +268,9 @@ private:
     bool do_settings(Record& r);                             // dconf load /
     bool undo_settings(Record& r, std::string& why);         // reset the added keys, load the saved dump
     bool do_root(Record& r);                                 // pkexec rouster-helper run <request>
+    bool prep_tag(Record& r, const Action& a);               // identity + what the tag is now
+    bool do_tag(Record& r);                                  // lsetxattr / lremovexattr
+    bool undo_tag(Record& r, std::string& why);              // same file, still our value -> put the old one back
     DconfRunner m_dconf;
     RootRunner  m_root;
     bool        m_root_dry = false;

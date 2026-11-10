@@ -5,4 +5,4 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -- -j"$(nproc)"
 echo ""
-echo "Built: ./build/liblatch.a   Install: ./install.sh"
+echo "Built: ./build/liblatch.a  ./build/latch_selftest   Install: ./install.sh"

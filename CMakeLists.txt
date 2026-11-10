@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(latch VERSION 0.1.0 LANGUAGES CXX)
+project(latch VERSION 0.2.0 LANGUAGES CXX)
 
 # latch -- the shared door (2026-11-10). Split out of Rouster so Rouster and
 # Tidy move files through ONE door: journal, manifest, identity-checked undo,
@@ -52,3 +52,11 @@ write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/latchConfigVersion.
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/latchConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/latchConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/latch)
+
+# ── latch's own selftest (latch s002: the Tag verb) ──────────────────────────
+# Built when latch is the top-level project (its own build.sh), not when an app
+# add_subdirectory()s it. Fixture home under /tmp; never the real home.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_executable(latch_selftest tests/tag_selftest.cpp)
+    target_link_libraries(latch_selftest PRIVATE latch)
+endif()
