@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(latch VERSION 0.2.0 LANGUAGES CXX)
+project(latch VERSION 0.3.0 LANGUAGES CXX)
 
 # latch -- the shared door (2026-11-10). Split out of Rouster so Rouster and
 # Tidy move files through ONE door: journal, manifest, identity-checked undo,

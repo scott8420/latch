@@ -222,6 +222,12 @@ std::string staging_prefix() {
 void set_app_name(std::string name) { g_app = name.empty() ? std::string("the app") : std::move(name); }
 const std::string& app_name() { return g_app; }
 
+namespace {
+std::vector<OwnFile> g_own;
+}  // namespace
+void set_own_files(std::vector<OwnFile> files) { g_own = std::move(files); }
+const std::vector<OwnFile>& own_files() { return g_own; }
+
 void set_root_rules(RootRules rules) { g_root_rules = std::move(rules); }
 const RootRules& root_rules() { return g_root_rules; }
 
@@ -940,6 +946,55 @@ Result Door::undo() {
     append(json{{"t", "batch-undone"}, {"batch", b->id}}.dump());
     res.ok = res.failed == 0 && res.done == todo;
     return res;
+}
+
+// ── Replace WITHOUT undo (latch s003) ────────────────────────────────────────
+std::string Door::replace_refusal(const std::string& path, const std::string& content) const {
+    const std::string name = fs::path(path).filename().string();
+    const OwnFile* own = nullptr;
+    for (const auto& o : g_own)
+        if (o.name == name) own = &o;
+    if (!own) return "not one of " + g_app + "'s own files: " + name;
+    // The place: as a Tag would be judged (clean path in home, nothing protected
+    // or symlinked on the way, not the Trash, not our records, no symlink, exists).
+    Action probe;
+    probe.verb = Verb::Tag;
+    probe.from = path;
+    probe.attr = std::string(kTagPrefix) + "replace";
+    probe.content = "x";
+    if (auto why = refusal(probe); !why.empty()) return why;
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) != 0) return "does not exist (a replace never creates): " + path;
+    if (!S_ISREG(st.st_mode)) return "not a regular file: " + path;
+    if (static_cast<std::size_t>(st.st_size) > kOwnMax) return "too big to be " + g_app + "'s: " + path;
+    std::ifstream in(path, std::ios::binary);
+    std::string first;
+    std::getline(in, first);
+    if (first.rfind(own->header, 0) != 0) return "its first line is not " + g_app + "'s header -- not ours: " + path;
+    if (content.size() > kOwnMax) return "the new text is too big: " + path;
+    if (content.rfind(own->header, 0) != 0) return "the new text does not start with the header: " + path;
+    return {};
+}
+
+std::string Door::replace_own(const std::string& path, const std::string& content) {
+    if (auto why = replace_refusal(path, content); !why.empty()) return why;
+    const fs::path p(path);
+    const std::string tmp = (p.parent_path() / (staging_prefix() + p.filename().string().substr(1) + ".new")).string();
+    struct stat st{};
+    if (::lstat(tmp.c_str(), &st) == 0) return "tmp name taken: " + tmp;
+    struct stat old{};
+    ::lstat(path.c_str(), &old);
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, old.st_mode & 0777);
+    if (fd < 0) return std::string("could not write ") + tmp + ": " + std::strerror(errno);
+    const bool wrote = ::write(fd, content.data(), content.size()) == static_cast<ssize_t>(content.size()) && ::fsync(fd) == 0;
+    ::close(fd);
+    if (!wrote) { ::unlink(tmp.c_str()); return "could not write " + tmp; }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        const std::string why = std::strerror(errno);
+        ::unlink(tmp.c_str());
+        return "could not put it in place: " + why;
+    }
+    return {};
 }
 
 }  // namespace latch::door

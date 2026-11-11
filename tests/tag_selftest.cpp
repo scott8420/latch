@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
+#include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -180,6 +182,65 @@ int main() {
         check(c.unfinished().size() == 1 && c.unfinished()[0].find("had happened") != std::string::npos,
               "crash resolved by looking at the tag: had happened");
         check(c.undo().ok && val(f, "user.tidy.purpose") == "<absent>", "and undo takes it back");
+    }
+
+    std::printf("-- replace without undo (latch s003)\n");
+    {
+        const std::string H = "# latchtest ids";
+        const std::string own = home + "/Documents/.latchtest-files";
+        touch(own, H + "\nold line\n");
+        Door r(home, data);
+        r.load();
+        const std::string nu = H + "\nnew line\n";
+        check(!r.replace_refusal(own, nu).empty(), "no files registered -> refused");
+        set_own_files({{".latchtest-files", H}});
+        check(r.replace_refusal(own, nu).empty(), "registered, ours -> may");
+        struct stat before{};
+        ::lstat(own.c_str(), &before);
+        const auto batches = r.batches().size();
+        std::error_code mec;
+        const auto msize = fs::file_size(r.manifest_path(), mec);
+        check(r.replace_own(own, nu).empty(), "replaced");
+        std::ifstream in(own);
+        std::string all((std::istreambuf_iterator<char>(in)), {});
+        struct stat after{};
+        ::lstat(own.c_str(), &after);
+        check(all == nu && after.st_ino != before.st_ino, "the new text in place (a new inode: tmp -> rename)");
+        check(r.batches().size() == batches && fs::file_size(r.manifest_path(), mec) == msize,
+              "no batch, no manifest line -- nothing to undo");
+        bool stray = false;
+        for (const auto& e : fs::directory_iterator(home + "/Documents"))
+            stray = stray || e.path().filename().string().find(".new") != std::string::npos;
+        check(!stray, "no tmp left behind");
+
+        touch(home + "/Documents/.other", H + "\n");
+        check(!r.replace_refusal(home + "/Documents/.other", nu).empty(), "a name not registered -> refused");
+        const std::string users = home + "/.latchtest-files";
+        touch(users, "my own notes\n");
+        check(!r.replace_refusal(users, nu).empty() && r.replace_own(users, nu) != "", "a user's file of that name (no header) -> refused");
+        { std::ifstream u(users); std::string l; std::getline(u, l); check(l == "my own notes", "and left as it was"); }
+        check(!r.replace_refusal(home + "/Pictures/.latchtest-files", nu).empty(), "missing -> refused (never creates)");
+        check(!r.replace_refusal(own, "no header\n").empty(), "new text without the header -> refused");
+        check(!r.replace_refusal(own, H + "\n" + std::string(kOwnMax, 'x')).empty(), "new text too big -> refused");
+        touch(home + "/fixes/.latchtest-files", H + "\n");
+        check(!r.replace_refusal(home + "/fixes/.latchtest-files", nu).empty(), "inside fixes/ (protected) -> refused");
+        fs::create_directories(home + "/Big");
+        touch(home + "/Big/.latchtest-files", H + "\n" + std::string(kOwnMax, 'y'));
+        check(!r.replace_refusal(home + "/Big/.latchtest-files", nu).empty(), "an old file too big to be ours -> refused");
+        fs::create_directories(home + "/Real");
+        touch(home + "/Real/.target", H + "\n");
+        fs::create_directories(home + "/Links");
+        fs::create_symlink(home + "/Real/.target", home + "/Links/.latchtest-files");
+        check(!r.replace_refusal(home + "/Links/.latchtest-files", nu).empty(), "a symlink -> refused");
+        fs::create_directory_symlink(home + "/Documents", home + "/Via");
+        check(!r.replace_refusal(home + "/Via/.latchtest-files", nu).empty(), "through a symlinked folder -> refused");
+        touch(root + "/.latchtest-files", H + "\n");
+        check(!r.replace_refusal(root + "/.latchtest-files", nu).empty(), "outside home -> refused");
+        touch(data + "/.latchtest-files", H + "\n");
+        check(!r.replace_refusal(data + "/.latchtest-files", nu).empty(), "in the app's records -> refused");
+        touch(home + "/.local/share/Trash/files/.latchtest-files", H + "\n");
+        check(!r.replace_refusal(home + "/.local/share/Trash/files/.latchtest-files", nu).empty(), "in the Trash -> refused");
+        set_own_files({});
     }
 
     fs::remove_all(root);

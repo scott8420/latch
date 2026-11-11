@@ -5,7 +5,7 @@ Split out of Rouster on 2026-11-10 so both apps go through ONE door.
 
 | Header | What |
 |---|---|
-| `latch/Door.hpp` | the one door: a previewed plan -> journal (fsync'd intent / outcome) -> rename; undo by identity (dev + inode); the manifest replayed after a crash; refusals (outside home, Protected, symlinked parents, the app's own records, packages split). 10 verbs: trash, move, write, clone, dedupe, mkdir, copy, settings, root, **tag** (0.2: set / clear one `user.tidy.*` xattr, old value journaled, undo puts it back) |
+| `latch/Door.hpp` | the one door: a previewed plan -> journal (fsync'd intent / outcome) -> rename; undo by identity (dev + inode); the manifest replayed after a crash; refusals (outside home, Protected, symlinked parents, the app's own records, packages split). 10 verbs: trash, move, write, clone, dedupe, mkdir, copy, settings, root, **tag** (0.2: set / clear one `user.tidy.*` xattr, old value journaled, undo puts it back). **0.3:** `Door::replace_own` -- an app's own registered dot files (Tidy's `.tidy-files`) rewritten in place, tmp -> rename, guarded (name, header, size, no symlink, exists), NO undo by design -- not a verb |
 | `latch/Protect.hpp` | the never-touch list, `fixes/`, places another of our apps owns (Samson), `*.samson` |
 | `latch/Package.hpp` | packages are one thing: `.scriv` and our apps' bundles, never split |
 | `latch/Vcs.hpp` | git / any program as a child process; `feed` through pipes |

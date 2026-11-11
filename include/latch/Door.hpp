@@ -169,6 +169,28 @@ struct RootRules {
 void set_app_name(std::string name);
 const std::string& app_name();
 
+// ── Replace WITHOUT undo (latch s003, for Tidy's own dot files) ──────────────
+// Scott (Tidy s011): "a special condition in latch to del". An app's OWN
+// bookkeeping files that live in the user's folders (Tidy: .tidy-files,
+// .tidy-project) are rewritten in place: the new text beside it (a hidden tmp
+// name), fsync, ONE rename over the old -- the old is gone, never half there.
+// No Trash, no staging, no manifest record, no undo: the app rebuilds them
+// from its own records. NOT a Verb -- it never sits in a batch Undo walks, and
+// the verb table stays as it is.
+// Guards (every one, or refused): a registered exact file name; a clean path
+// in home, nothing protected or symlinked on the way, not the Trash, not the
+// app's records; the file EXISTS (a rewrite, never a create or a bare delete),
+// is a regular file (no symlink), <= kOwnMax, and its first line starts with
+// the registered header -- a user's file of that name is refused. The new
+// text must start with the header too and be <= kOwnMax.
+struct OwnFile {
+    std::string name;     // ".tidy-files"
+    std::string header;   // what its first line starts with: "# Tidy file ids"
+};
+inline constexpr std::size_t kOwnMax = 64 * 1024;
+void set_own_files(std::vector<OwnFile> files);   // once at startup; none -> every replace refused
+const std::vector<OwnFile>& own_files();
+
 void set_root_rules(RootRules rules);
 const RootRules& root_rules();
 // {"/usr/bin/pkexec", helper_path, "run", ["--dry-run",] request}
@@ -242,6 +264,11 @@ public:
                         const std::vector<std::string>& freed) const;
 
     Result run(const Plan& plan);
+    // Replace WITHOUT undo (above). "" = may; else why not.
+    std::string replace_refusal(const std::string& path, const std::string& content) const;
+    // "" = replaced; else why not (refused, or the write / rename failed --
+    // then the old file stays as it was).
+    std::string replace_own(const std::string& path, const std::string& content);
     void set_dconf(DconfRunner r) { m_dconf = std::move(r); }
     void set_root(RootRunner r, bool dry) { m_root = std::move(r); m_root_dry = dry; }
     Result undo();                          // the last batch not yet undone
