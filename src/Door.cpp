@@ -228,6 +228,61 @@ std::vector<OwnFile> g_own;
 void set_own_files(std::vector<OwnFile> files) { g_own = std::move(files); }
 const std::vector<OwnFile>& own_files() { return g_own; }
 
+namespace {
+std::vector<MediaRoot> g_media;
+bool trash_name(const std::string& part) { return part.rfind(".Trash", 0) == 0; }
+}  // namespace
+void set_media_roots(std::vector<MediaRoot> roots) {
+    for (auto& m : roots) while (m.path.size() > 1 && m.path.back() == '/') m.path.pop_back();
+    g_media = std::move(roots);
+}
+const std::vector<MediaRoot>& media_roots() { return g_media; }
+
+std::string media_root_problem(const MediaRoot& m, const std::string& home) {
+    const std::string& p = m.path;
+    if (p.empty() || p[0] != '/' || fs::path(p).lexically_normal().string() != p || p == "/" || p.back() == '/')
+        return "not a clean absolute folder: " + p;
+    if (inside(p, home) || inside(home, p)) return "in or around the home folder: " + p;
+    for (const auto& part : fs::path(p)) if (trash_name(part.string())) return "a trash folder: " + p;
+    struct stat st{};
+    if (::lstat(p.c_str(), &st) != 0) return "not there (not mounted?): " + p;
+    if (S_ISLNK(st.st_mode)) return "a symlink: " + p;
+    if (!S_ISDIR(st.st_mode)) return "not a folder: " + p;
+    if (::access(p.c_str(), W_OK) != 0) return "not writable: " + p;
+    if (m.other_disk) {
+        struct stat hs{}, rs{};
+        if (::stat(home.c_str(), &hs) == 0 && hs.st_dev == st.st_dev)
+            return "on the same disk as home (not mounted?): " + p;
+        if (::stat("/", &rs) == 0 && rs.st_dev == st.st_dev) return "on the system disk (not mounted?): " + p;
+    }
+    return {};
+}
+
+const MediaRoot* media_root_of(const std::string& path) {
+    for (const auto& m : g_media)
+        if (!m.path.empty() && path != m.path && inside(path, m.path)) return &m;
+    return nullptr;
+}
+
+std::string media_trash_dir(const MediaRoot& m) {
+    const std::string uid = std::to_string(::getuid());
+    struct stat st{};
+    if (::stat(m.path.c_str(), &st) != 0) return m.path + "/.Trash-" + uid;
+    // The disk's top: walk up while the parent is on the same device.
+    fs::path top = m.path;
+    while (top.has_parent_path() && top != top.parent_path()) {
+        struct stat ps{};
+        if (::stat(top.parent_path().c_str(), &ps) != 0 || ps.st_dev != st.st_dev) break;
+        top = top.parent_path();
+    }
+    const std::string t = (top / (".Trash-" + uid)).string();
+    struct stat ts{};
+    if (::lstat(t.c_str(), &ts) == 0 ? S_ISDIR(ts.st_mode) && !S_ISLNK(ts.st_mode)
+                                     : top != "/" && ::access(top.c_str(), W_OK) == 0)
+        return t;
+    return m.path + "/.Trash-" + uid;
+}
+
 void set_root_rules(RootRules rules) { g_root_rules = std::move(rules); }
 const RootRules& root_rules() { return g_root_rules; }
 
@@ -423,6 +478,7 @@ std::string Door::refusal(const Action& a, const std::vector<std::string>& made,
             if (::lstat(a.from.c_str(), &ss) != 0 || !S_ISREG(ss.st_mode)) return "not a file: " + a.from;
         } else if (!a.from.empty()) return "a " + std::string(verb_name(a.verb)) + " has no source";
         if (bad(a.to)) return "not a clean absolute path to create: " + a.to;
+        if (const MediaRoot* mr = media_root_of(a.to)) return media_refusal(a, *mr, made);   // s004
         if (!inside(a.to, m_home) || a.to == m_home) return "outside the home folder: " + a.to;
         if (inside(a.to, m_trash) || inside(m_trash, a.to)) return "not in the Trash: " + a.to;
         if (inside(a.to, m_data) || inside(m_data, a.to)) return own_records() + a.to;
@@ -499,17 +555,58 @@ std::string Door::refusal(const Action& a, const std::vector<std::string>& made,
     return {};
 }
 
+std::string Door::trash_for(const std::string& path) const {
+    if (const MediaRoot* m = media_root_of(path)) return media_trash_dir(*m);
+    return m_trash;
+}
+
+// A create onto a registered media root (s004). Copy's source was checked by
+// the caller (a file in home, nothing protected on the way).
+std::string Door::media_refusal(const Action& a, const MediaRoot& m, const std::vector<std::string>& made) const {
+    const auto planned = [&](const std::string& p) { return std::find(made.begin(), made.end(), p) != made.end(); };
+    const std::string where = m.label.empty() ? m.path : m.label;
+    if (a.verb != Verb::Copy && a.verb != Verb::MakeDir && a.verb != Verb::Write)
+        return std::string("only copy, mkdir and write go onto ") + where + ": " + a.to;
+    if (auto why = media_root_problem(m, m_home); !why.empty()) return where + ": " + why;
+    const std::string rel = a.to.substr(m.path.size() + 1);
+    std::string cur;
+    std::size_t pos = 0;
+    while (true) {
+        const auto s = rel.find('/', pos);
+        cur = rel.substr(0, s);
+        const bool last = s == std::string::npos;
+        const std::string part = rel.substr(pos, last ? std::string::npos : s - pos);
+        if (trash_name(part)) return "not in the trash: " + a.to;
+        const std::string abs = m.path + "/" + cur;
+        struct stat st{};
+        if (::lstat(abs.c_str(), &st) != 0) {
+            if (last) break;
+            if (planned(abs)) { pos = s + 1; continue; }
+            return "does not exist: " + abs;
+        }
+        if (last) return "already exists on " + where + ": " + a.to;
+        if (S_ISLNK(st.st_mode)) return "goes through a symlink on " + where + ": " + abs;
+        if (!S_ISDIR(st.st_mode)) return "not a folder: " + abs;
+        pos = s + 1;
+    }
+    if (planned(a.to)) return "already exists: " + a.to;
+    if (a.verb == Verb::Write && a.content.size() > kWriteMax) return "too big to write: " + a.to;
+    return {};
+}
+
 bool Door::reserve_trash(const std::string& path, std::int64_t when, std::string& dest_out,
                          std::string& info_out, std::string& err) {
     std::error_code ec;
-    fs::create_directories(m_trash + "/files", ec);
-    fs::create_directories(m_trash + "/info", ec);
+    const std::string trash = trash_for(path);   // s004: a media root's own trash -- a rename on that disk
+    fs::create_directories(trash + "/files", ec);
+    fs::create_directories(trash + "/info", ec);
+    if (trash != m_trash) ::chmod(trash.c_str(), 0700);
     const std::string base = fs::path(path).filename().string();
     // Reserve a name by creating its .trashinfo exclusively (the spec's way).
     for (int n = 1; n < 10000; ++n) {
         const std::string name = n == 1 ? base : base + "." + std::to_string(n);
-        const std::string info = m_trash + "/info/" + name + ".trashinfo";
-        const std::string dest = m_trash + "/files/" + name;
+        const std::string info = trash + "/info/" + name + ".trashinfo";
+        const std::string dest = trash + "/files/" + name;
         struct stat st{};
         if (::lstat(dest.c_str(), &st) == 0) continue;
         const int fd = ::open(info.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);

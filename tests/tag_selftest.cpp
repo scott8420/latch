@@ -243,6 +243,125 @@ int main() {
         set_own_files({});
     }
 
+    // ── latch s004: media roots -- creates onto a registered backup folder ──
+    {
+        std::printf("[media]\n");
+        const std::string media = root + "/media/Big SSD/Archive";   // a disk's folder (same disk here: other_disk off)
+        fs::create_directories(media);
+        fs::create_directories(home + "/Archive/2026");
+        touch(home + "/Archive/2026/a.odt", "alpha bytes");
+        touch(home + "/Archive/2026/b.odt", "beta");
+        const auto slurp = [](const std::string& p) { std::ifstream i(p); return std::string(std::istreambuf_iterator<char>(i), {}); };
+        const auto mk = [](Verb v, const std::string& from, const std::string& to) {
+            Action a;
+            a.verb = v;
+            a.from = from;
+            a.to = to;
+            return a;
+        };
+        Door d(home, data);
+        d.load();
+        const Action cp = mk(Verb::Copy, home + "/Archive/2026/a.odt", media + "/2026/a.odt");
+        check(!d.refusal(cp, {media + "/2026"}).empty(), "no media registered -> outside home, refused");
+
+        MediaRoot same{media, "Big SSD", true};
+        check(!media_root_problem(same, home).empty(), "other_disk on: a folder on home's own disk -> refused (not mounted?)");
+        check(!media_root_problem({home + "/Backup", "x", false}, home).empty(), "a root in home -> refused");
+        check(!media_root_problem({root, "x", false}, home).empty(), "a root around home -> refused");
+        check(!media_root_problem({"/", "x", false}, home).empty(), "\"/\" -> refused");
+        check(!media_root_problem({root + "/media/missing", "x", false}, home).empty(), "missing (not mounted) -> refused");
+        fs::create_directory_symlink(media, root + "/media/link");
+        check(!media_root_problem({root + "/media/link", "x", false}, home).empty(), "a symlink -> refused");
+        check(!media_root_problem({media + "/", "x", false}, home).empty(), "not clean (trailing /) -> refused");
+        check(media_root_problem({media, "x", false}, home).empty(), "a real folder, other_disk off -> usable");
+
+        set_media_roots({{media, "Big SSD", false}});
+        check(media_root_of(media + "/2026/a.odt") && !media_root_of(media) && !media_root_of(home + "/x"),
+              "media_root_of: strictly below a root");
+        const Action mkd = mk(Verb::MakeDir, "", media + "/2026");
+        check(d.refusal(mkd, {}).empty() && d.refusal(cp, {media + "/2026"}).empty(),
+              "MakeDir then Copy onto the media: allowed (in plan order)");
+        check(!d.refusal(cp, {}).empty(), "...a Copy into a folder not there and not planned: refused");
+        check(!d.refusal(mk(Verb::Move, home + "/Archive/2026/a.odt", media + "/a.odt"), {}).empty(),
+              "Move onto the media: refused (never moves there)");
+        Action cl = mk(Verb::Clone, "", media + "/repo");
+        cl.url = "https://example.com/x.git";
+        check(!d.refusal(cl, {}).empty(), "Clone onto the media: refused");
+        check(!d.refusal(mk(Verb::Trash, media + "/x", ""), {}).empty(), "Trash of something on the media: refused");
+        check(!d.refusal(mk(Verb::Copy, root + "/media/x", media + "/x"), {}).empty(),
+              "Copy whose source is outside home: refused");
+        check(!d.refusal(mk(Verb::MakeDir, "", media + "/.Trash-1000"), {}).empty(), "into a .Trash*: refused");
+
+        Plan p;
+        p.label = "Back up: 2 files -> Big SSD";
+        p.actions = {mkd, cp, mk(Verb::Copy, home + "/Archive/2026/b.odt", media + "/2026/b.odt")};
+        check(!d.run(p).ok && !fs::exists(media + "/2026"), "refused unpreviewed; nothing made");
+        p.previewed = true;
+        const auto r = d.run(p);
+        struct stat sa{}, sm{};
+        ::stat((home + "/Archive/2026/a.odt").c_str(), &sa);
+        ::stat((media + "/2026/a.odt").c_str(), &sm);
+        check(r.ok && r.done == 3 && slurp(media + "/2026/a.odt") == "alpha bytes" && slurp(media + "/2026/b.odt") == "beta" &&
+              slurp(home + "/Archive/2026/a.odt") == "alpha bytes" && sa.st_ino != sm.st_ino,
+              "run: copied onto the media (the source untouched, a new file there)");
+        bool staging = false;
+        for (const auto& e : fs::directory_iterator(media + "/2026"))
+            staging = staging || e.path().filename().string()[0] == '.';
+        check(!staging, "no staging name left on the media");
+        touch(home + "/Archive/2026/a2.odt", "changed");
+        check(!d.refusal(mk(Verb::Copy, home + "/Archive/2026/a2.odt", media + "/2026/a.odt"), {}).empty() &&
+              slurp(media + "/2026/a.odt") == "alpha bytes", "never over a file already on the media");
+        check(!d.refusal(mk(Verb::MakeDir, "", media + "/2026"), {}).empty(), "never over a folder already there");
+
+        // Undo: into the disk's own trash, not home's.
+        const std::string mt = media_trash_dir({media, "", false});
+        const auto u = d.undo();
+        check(u.ok && !fs::exists(media + "/2026") && fs::exists(mt + "/files/a.odt") && fs::exists(mt + "/files/b.odt") &&
+              fs::exists(mt + "/files/2026") && fs::exists(mt + "/info/a.odt.trashinfo") &&
+              slurp(home + "/Archive/2026/a.odt") == "alpha bytes",
+              "undo: what was made went to the media's own trash (" + mt.substr(root.size()) + "); the source stays");
+        check(!fs::exists(home + "/.local/share/Trash/files/a.odt"), "...not into home's Trash");
+        Door again(home, data);
+        again.load();
+        check(again.batches().back().undone && again.unfinished().empty(), "the manifest replays: batch undone, nothing unfinished");
+
+        // A real other disk, when this machine has one to hand (/dev/shm is a tmpfs):
+        // other_disk ON passes; undo lands in that disk's top .Trash-<uid>.
+        {
+            struct stat a{}, b{};
+            const std::string shm = "/dev/shm/latch-media-" + std::to_string(::getpid());
+            if (::stat("/dev/shm", &a) == 0 && ::stat(home.c_str(), &b) == 0 && a.st_dev != b.st_dev &&
+                fs::create_directories(shm + "/Archive")) {
+                MediaRoot real{shm + "/Archive", "shm", true};
+                set_media_roots({real});
+                Plan q;
+                q.label = "Back up: a.odt -> shm";
+                q.previewed = true;
+                q.actions = {mk(Verb::Copy, home + "/Archive/2026/a.odt", shm + "/Archive/a.odt")};
+                const auto rr = d.run(q);
+                const std::string top = "/dev/shm/.Trash-" + std::to_string(::getuid());
+                const bool had_top = fs::exists(top);
+                const auto uu = d.undo();
+                check(media_root_problem(real, home).empty() && rr.ok && uu.ok && !fs::exists(shm + "/Archive/a.odt") &&
+                          (media_trash_dir(real) == top || !had_top),
+                      "another disk (/dev/shm), other_disk on: copied, undone into " + media_trash_dir(real));
+                std::error_code ec;
+                fs::remove_all(shm, ec);
+                for (const auto& e : fs::directory_iterator(top + "/files", ec))
+                    if (e.path().filename().string().rfind("a.odt", 0) == 0) fs::remove(e.path(), ec);
+                for (const auto& e : fs::directory_iterator(top + "/info", ec))
+                    if (e.path().filename().string().rfind("a.odt", 0) == 0) fs::remove(e.path(), ec);
+            } else {
+                std::printf("  SKIP  another disk: /dev/shm not on its own filesystem here\n");
+            }
+        }
+
+        // A root that went away (unplugged): refused, nothing written.
+        set_media_roots({{root + "/media/Gone", "Gone", false}});
+        check(!d.refusal(mk(Verb::MakeDir, "", root + "/media/Gone/2026"), {}).empty(), "unplugged root -> refused");
+        set_media_roots({});
+    }
+
     fs::remove_all(root);
     std::printf("-----------------------------------------------\n%d pass / %d fail\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -191,6 +191,36 @@ inline constexpr std::size_t kOwnMax = 64 * 1024;
 void set_own_files(std::vector<OwnFile> files);   // once at startup; none -> every replace refused
 const std::vector<OwnFile>& own_files();
 
+// ── Media roots (latch s004, for Tidy's archive backup) ───────────────────────
+// Scott (Tidy s014, "a"): the door may CREATE on a backup disk the app
+// registers -- the big SSD (/run/media/scott/<label>), the Pi's standard
+// mount. Only the create verbs Copy (the source still a file in home),
+// MakeDir and Write; never Move / Trash / Tag / Dedupe / Clone there, never
+// over anything (a create must not exist). Undo puts what was made into that
+// disk's own trash ($topdir/.Trash-<uid>, the freedesktop place; the media
+// folder's own .Trash-<uid> when the disk's top is not writable) -- a rename on
+// the same disk, never a copy back.
+// Guards: a clean absolute folder, not "/", not in or around home, a real
+// folder (no symlink), writable; nothing symlinked below it on the way; never
+// into a .Trash*. `other_disk` (default ON): the folder must be on another
+// filesystem than home and "/" -- an UNMOUNTED mount point is just an empty
+// folder on the system disk, and is refused ("not mounted?"). Set once at
+// startup (and again when the app's settings change); none -> every create
+// outside home refused, as before.
+struct MediaRoot {
+    std::string path;          // "/run/media/scott/Big SSD/Archive"
+    std::string label;         // what the app calls it ("Big SSD")
+    bool other_disk = true;    // the selftest turns it off (its fixtures live on one disk)
+};
+void set_media_roots(std::vector<MediaRoot> roots);
+const std::vector<MediaRoot>& media_roots();
+// "" = usable now; else why not (said in the preview).
+std::string media_root_problem(const MediaRoot& m, const std::string& home);
+// The registered root `path` is strictly below, or nullptr.
+const MediaRoot* media_root_of(const std::string& path);
+// Where an undo puts what the door made under `m` (exists or not yet).
+std::string media_trash_dir(const MediaRoot& m);
+
 void set_root_rules(RootRules rules);
 const RootRules& root_rules();
 // {"/usr/bin/pkexec", helper_path, "run", ["--dry-run",] request}
@@ -286,6 +316,8 @@ private:
     bool do_trash(Record& r);
     bool reserve_trash(const std::string& path, std::int64_t when, std::string& dest,
                        std::string& info, std::string& err);   // name + .trashinfo, for `path`
+    std::string trash_for(const std::string& path) const;    // home's Trash, or a media root's (s004)
+    std::string media_refusal(const Action& a, const MediaRoot& m, const std::vector<std::string>& made) const;
     bool trash_now(const std::string& path, std::string& dest, std::string& err);   // reserve + rename
     bool do_create(Record& r, const Action& a);              // Write / Clone into staging (r.from)
     bool do_move(Record& r);
